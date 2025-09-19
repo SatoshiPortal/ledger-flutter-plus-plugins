@@ -29,11 +29,34 @@ class SpeculosBitcoinLedgerApp {
   BitcoinTransformer transformer;
 
   final String derivationPath;
+  final WalletPolicy walletPolicy;
 
   SpeculosBitcoinLedgerApp({
     this.transformer = const BitcoinTransformer(),
     this.derivationPath = "m/84'/0'/0'/0/0",
-  });
+    WalletPolicy? walletPolicy,
+  }) : walletPolicy = walletPolicy ?? NativeSegwitWalletPolicy([]);
+
+  /// Factory constructors for common wallet policy types
+  factory SpeculosBitcoinLedgerApp.nativeSegwit({
+    BitcoinTransformer transformer = const BitcoinTransformer(),
+    String derivationPath = "m/84'/0'/0'/0/0",
+  }) => SpeculosBitcoinLedgerApp(transformer: transformer, derivationPath: derivationPath, walletPolicy: NativeSegwitWalletPolicy([]));
+
+  factory SpeculosBitcoinLedgerApp.nestedSegwit({
+    BitcoinTransformer transformer = const BitcoinTransformer(),
+    String derivationPath = "m/49'/0'/0'/0/0",
+  }) => SpeculosBitcoinLedgerApp(transformer: transformer, derivationPath: derivationPath, walletPolicy: NestedSegwitWalletPolicy([]));
+
+  factory SpeculosBitcoinLedgerApp.legacy({
+    BitcoinTransformer transformer = const BitcoinTransformer(),
+    String derivationPath = "m/44'/0'/0'/0/0",
+  }) => SpeculosBitcoinLedgerApp(transformer: transformer, derivationPath: derivationPath, walletPolicy: LegacyWalletPolicy([]));
+
+  factory SpeculosBitcoinLedgerApp.taproot({
+    BitcoinTransformer transformer = const BitcoinTransformer(),
+    String derivationPath = "m/86'/0'/0'/0/0",
+  }) => SpeculosBitcoinLedgerApp(transformer: transformer, derivationPath: derivationPath, walletPolicy: TaprootWalletPolicy([]));
 
   Future<List<String>> getAccounts({String? accountsDerivationPath}) async {
     final bipPath =
@@ -46,7 +69,7 @@ class SpeculosBitcoinLedgerApp {
       path: bipPath,
       accountXPub: accountXPub,
       masterFingerprint: masterFingerprint,
-      descrTempl: "wpkh(@0)",
+      descrTempl: walletPolicy.descriptorTemplate,
       display: false,
     );
     return [addr.toAsciiString()];
@@ -94,6 +117,20 @@ class SpeculosBitcoinLedgerApp {
     );
   }
 
+  WalletPolicy _createWalletPolicyInstance(List<String> keys) {
+    if (walletPolicy is LegacyWalletPolicy) {
+      return LegacyWalletPolicy(keys);
+    } else if (walletPolicy is NativeSegwitWalletPolicy) {
+      return NativeSegwitWalletPolicy(keys);
+    } else if (walletPolicy is NestedSegwitWalletPolicy) {
+      return NestedSegwitWalletPolicy(keys);
+    } else if (walletPolicy is TaprootWalletPolicy) {
+      return TaprootWalletPolicy(keys);
+    } else {
+      return WalletPolicy("", walletPolicy.descriptorTemplate, keys);
+    }
+  }
+
   Future<Uint8List> _getWalletAddress({
     required BIPPath path,
     required String accountXPub,
@@ -106,7 +143,9 @@ class SpeculosBitcoinLedgerApp {
 
     if (accountPath.length + 2 != pathElements.length) return Uint8List(0);
 
-    final policy = WalletPolicy("", descrTempl,
+    // Use the provided descriptor template or fall back to the wallet policy's template
+    final template = descrTempl.isNotEmpty ? descrTempl : walletPolicy.descriptorTemplate;
+    final policy = WalletPolicy("", template,
         [createKey(masterFingerprint, accountPath, accountXPub)]);
     final changeAndIndex = pathElements.sublist(pathElements.length - 2);
 
@@ -147,10 +186,13 @@ class SpeculosBitcoinLedgerApp {
     final accountXPub = await getXPubKey(
         derivationPath: bipPath.toHardenedBIPPath().toString());
 
+    // Create a new wallet policy instance with the same type as the configured one
+    final policyKeys = [createKey(masterFingerprint, bipPath.hardenedPath, accountXPub)];
+    final policy = _createWalletPolicyInstance(policyKeys);
+
     return _signPsbt(
         psbt: psbt,
-        walletPolicy: NativeSegwitWalletPolicy(
-            [createKey(masterFingerprint, bipPath.hardenedPath, accountXPub)]));
+        walletPolicy: policy);
   }
 
   Future<Uint8List> _signPsbt({
