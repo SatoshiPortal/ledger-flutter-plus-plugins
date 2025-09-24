@@ -1,4 +1,3 @@
-import 'package:ledger_flutter_plus/ledger_flutter_plus.dart';
 import 'package:ledger_bitcoin/ledger_bitcoin.dart';
 
 Future<void> main() async {
