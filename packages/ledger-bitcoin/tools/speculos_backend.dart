@@ -165,7 +165,7 @@ class SpeculosBitcoinLedgerApp {
     final clientInterpreter = ClientCommandInterpreter(() {});
     clientInterpreter
         .addKnownList(policy.keys.map((k) => ascii.encode(k)).toList());
-    clientInterpreter.addKnownPreimage(policy.serialize());
+    clientInterpreter.addKnownPreimage(policy.serializeLegacy());
 
     return await runFlow(
       BitcoinWalletAddressOperation(
@@ -209,7 +209,7 @@ class SpeculosBitcoinLedgerApp {
     // prepare ClientCommandInterpreter
     final clientInterpreter = ClientCommandInterpreter(() {})
       ..addKnownList(walletPolicy.keys.map((k) => ascii.encode(k)).toList())
-      ..addKnownPreimage(walletPolicy.serialize())
+      ..addKnownPreimage(walletPolicy.serializeLegacy())
       ..addKnownMapping(merkelizedPsbt.globalMerkleMap);
 
     for (final map in merkelizedPsbt.inputMerkleMaps) {

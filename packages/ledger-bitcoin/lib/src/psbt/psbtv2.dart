@@ -154,6 +154,34 @@ class PsbtV2 {
       _getInputOptional(inputIndex, PSBTIn.sequence, _b())?.readUint32LE(0) ??
       0xffffffff;
 
+  void setInputRequiredTimeLocktime(int inputIndex, int locktime) =>
+      _setInput(
+        inputIndex,
+        PSBTIn.requiredTimeLocktime,
+        _b(),
+        locktime.toUint32LE(),
+      );
+
+  int? getInputRequiredTimeLocktime(int inputIndex) => _getInputOptional(
+        inputIndex,
+        PSBTIn.requiredTimeLocktime,
+        _b(),
+      )?.readUint32LE(0);
+
+  void setInputRequiredHeightLocktime(int inputIndex, int locktime) =>
+      _setInput(
+        inputIndex,
+        PSBTIn.requiredHeightLocktime,
+        _b(),
+        locktime.toUint32LE(),
+      );
+
+  int? getInputRequiredHeightLocktime(int inputIndex) => _getInputOptional(
+        inputIndex,
+        PSBTIn.requiredHeightLocktime,
+        _b(),
+      )?.readUint32LE(0);
+
   void setInputTapKeySig(int inputIndex, Uint8List sig) =>
       _setInput(inputIndex, PSBTIn.tapKeySig, _b(), sig);
 
@@ -263,20 +291,212 @@ class PsbtV2 {
   }
 
   void deserialize(Uint8List psbt) {
+    globalMap.clear();
+    inputMaps.clear();
+    outputMaps.clear();
+
     final bufferReader = BufferReader(psbt);
     if (!listEquals(bufferReader.readSlice(5), psbtMagicBytes)) {
       throw Exception("Invalid magic bytes");
     }
     while (_readKeyPair(globalMap, bufferReader)) {}
 
-    for (var i = 0; i < getGlobalInputCount(); i++) {
+    final versionBytes = _getGlobalOptional(PSBTGlobal.version);
+    final psbtVersion = versionBytes?.readUint32LE(0) ?? 0;
+    if (psbtVersion != 0 && psbtVersion != 2) {
+      throw Exception('Only PSBT versions 0 and 2 are supported');
+    }
+    _validateGlobalVersionFields(psbtVersion);
+
+    final unsignedTransaction = psbtVersion == 0
+        ? _parseUnsignedTransaction(
+            _getGlobalOptional(PSBTGlobal.unsignedTX) ??
+                (throw const FormatException(
+                  'PSBT v0 is missing its unsigned transaction',
+                )),
+          )
+        : null;
+    final inputCount =
+        unsignedTransaction?.inputs.length ?? getGlobalInputCount();
+    final outputCount =
+        unsignedTransaction?.outputs.length ?? getGlobalOutputCount();
+
+    for (var i = 0; i < inputCount; i++) {
       inputMaps.insert(i, <String, Uint8List>{});
       while (_readKeyPair(inputMaps[i], bufferReader)) {}
     }
-    for (var i = 0; i < getGlobalOutputCount(); i++) {
+    for (var i = 0; i < outputCount; i++) {
       outputMaps.insert(i, <String, Uint8List>{});
       while (_readKeyPair(outputMaps[i], bufferReader)) {}
     }
+
+    if (bufferReader.available() != 0) {
+      throw Exception('Unexpected trailing PSBT data');
+    }
+    _validateMapVersionFields(psbtVersion);
+
+    if (unsignedTransaction != null) {
+      _normalizeToV2(unsignedTransaction);
+    }
+  }
+
+  void _validateGlobalVersionFields(int psbtVersion) {
+    if (psbtVersion == 2) {
+      if (_containsKeyType(globalMap, PSBTGlobal.unsignedTX.value)) {
+        throw const FormatException(
+          'PSBT v2 cannot contain an unsigned transaction',
+        );
+      }
+      final v2KeyTypes = [
+        PSBTGlobal.txVersion.value,
+        PSBTGlobal.fallbackLocktime.value,
+        PSBTGlobal.inputCount.value,
+        PSBTGlobal.outputCount.value,
+        PSBTGlobal.txModifiable.value,
+        PSBTGlobal.version.value,
+      ];
+      if (v2KeyTypes.any(
+        (keyType) => _containsNonEmptyKeyData(globalMap, keyType),
+      )) {
+        throw const FormatException('PSBT v2 global field contains key data');
+      }
+      final requiredKeyTypes = [
+        PSBTGlobal.txVersion.value,
+        PSBTGlobal.inputCount.value,
+        PSBTGlobal.outputCount.value,
+      ];
+      if (requiredKeyTypes.any(
+        (keyType) => !_containsEmptyKeyData(globalMap, keyType),
+      )) {
+        throw const FormatException(
+            'PSBT v2 is missing a required global field');
+      }
+      return;
+    }
+
+    final v2KeyTypes = [
+      PSBTGlobal.txVersion.value,
+      PSBTGlobal.fallbackLocktime.value,
+      PSBTGlobal.inputCount.value,
+      PSBTGlobal.outputCount.value,
+      PSBTGlobal.txModifiable.value,
+    ];
+    if (v2KeyTypes.any((keyType) => _containsKeyType(globalMap, keyType))) {
+      throw const FormatException('PSBT v0 contains a PSBT v2 global field');
+    }
+  }
+
+  void _validateMapVersionFields(int psbtVersion) {
+    if (psbtVersion == 2) {
+      final v2InputKeyTypes = [
+        PSBTIn.previousTXID.value,
+        PSBTIn.outputIndex.value,
+        PSBTIn.sequence.value,
+        PSBTIn.requiredTimeLocktime.value,
+        PSBTIn.requiredHeightLocktime.value,
+      ];
+      if (inputMaps.any(
+        (map) => v2InputKeyTypes.any(
+          (keyType) => _containsNonEmptyKeyData(map, keyType),
+        ),
+      )) {
+        throw const FormatException('PSBT v2 input field contains key data');
+      }
+      final requiredInputKeyTypes = [
+        PSBTIn.previousTXID.value,
+        PSBTIn.outputIndex.value,
+      ];
+      if (inputMaps.any(
+        (map) => requiredInputKeyTypes.any(
+          (keyType) => !_containsEmptyKeyData(map, keyType),
+        ),
+      )) {
+        throw const FormatException(
+            'PSBT v2 input is missing a required field');
+      }
+
+      final v2OutputKeyTypes = [
+        PSBTOut.amount.value,
+        PSBTOut.script.value,
+      ];
+      if (outputMaps.any(
+        (map) => v2OutputKeyTypes.any(
+          (keyType) => _containsNonEmptyKeyData(map, keyType),
+        ),
+      )) {
+        throw const FormatException('PSBT v2 output field contains key data');
+      }
+      final requiredOutputKeyTypes = [
+        PSBTOut.amount.value,
+        PSBTOut.script.value,
+      ];
+      if (outputMaps.any(
+        (map) => requiredOutputKeyTypes.any(
+          (keyType) => !_containsEmptyKeyData(map, keyType),
+        ),
+      )) {
+        throw const FormatException(
+            'PSBT v2 output is missing a required field');
+      }
+      return;
+    }
+
+    final v2InputKeyTypes = [
+      PSBTIn.previousTXID.value,
+      PSBTIn.outputIndex.value,
+      PSBTIn.sequence.value,
+      PSBTIn.requiredTimeLocktime.value,
+      PSBTIn.requiredHeightLocktime.value,
+    ];
+    if (inputMaps.any(
+      (map) => v2InputKeyTypes.any(
+        (keyType) => _containsKeyType(map, keyType),
+      ),
+    )) {
+      throw const FormatException('PSBT v0 contains a PSBT v2 input field');
+    }
+
+    final v2OutputKeyTypes = [PSBTOut.amount.value, PSBTOut.script.value];
+    if (outputMaps.any(
+      (map) => v2OutputKeyTypes.any(
+        (keyType) => _containsKeyType(map, keyType),
+      ),
+    )) {
+      throw const FormatException('PSBT v0 contains a PSBT v2 output field');
+    }
+  }
+
+  bool _containsKeyType(Map<String, Uint8List> map, int keyType) =>
+      map.keys.any((key) => _isKeyType(key, [keyType]));
+
+  bool _containsEmptyKeyData(Map<String, Uint8List> map, int keyType) =>
+      map.containsKey(Key(keyType, Uint8List(0)).toString());
+
+  bool _containsNonEmptyKeyData(Map<String, Uint8List> map, int keyType) {
+    final emptyKey = Key(keyType, Uint8List(0)).toString();
+    return map.keys.any(
+      (key) => key != emptyKey && _isKeyType(key, [keyType]),
+    );
+  }
+
+  void _normalizeToV2(_UnsignedTransaction transaction) {
+    setGlobalPsbtVersion(2);
+    setGlobalTxVersion(transaction.version);
+    setGlobalFallbackLocktime(transaction.locktime);
+    setGlobalInputCount(transaction.inputs.length);
+    setGlobalOutputCount(transaction.outputs.length);
+
+    for (final (index, input) in transaction.inputs.indexed) {
+      setInputPreviousTxId(index, input.txid);
+      setInputOutputIndex(index, input.outputIndex);
+      setInputSequence(index, input.sequence);
+    }
+    for (final (index, output) in transaction.outputs.indexed) {
+      setOutputAmount(index, output.amount);
+      setOutputScript(index, output.script);
+    }
+
+    globalMap.remove(Key(PSBTGlobal.unsignedTX.value, Uint8List(0)).toString());
   }
 
   bool _readKeyPair(Map<String, Uint8List> map, BufferReader bufferReader) {
@@ -393,3 +613,55 @@ class PsbtV2 {
 
   Uint8List _b() => Uint8List(0);
 }
+
+_UnsignedTransaction _parseUnsignedTransaction(Uint8List bytes) {
+  final reader = BufferReader(bytes);
+  final version = reader.readUInt32();
+  final inputs = <_UnsignedTransactionInput>[];
+
+  final inputCount = reader.readVarInt();
+  for (var i = 0; i < inputCount; i++) {
+    final txid = reader.readSlice(32);
+    final outputIndex = reader.readUInt32();
+    if (reader.readVarSlice().isNotEmpty) {
+      throw Exception('PSBT unsigned transaction has a non-empty scriptSig');
+    }
+    inputs.add((
+      txid: txid,
+      outputIndex: outputIndex,
+      sequence: reader.readUInt32(),
+    ));
+  }
+
+  final outputs = <_UnsignedTransactionOutput>[];
+  final outputCount = reader.readVarInt();
+  for (var i = 0; i < outputCount; i++) {
+    outputs.add((amount: reader.readUInt64(), script: reader.readVarSlice()));
+  }
+
+  final locktime = reader.readUInt32();
+  if (reader.available() != 0) {
+    throw Exception('Unexpected trailing transaction data');
+  }
+  return (
+    version: version,
+    inputs: inputs,
+    outputs: outputs,
+    locktime: locktime,
+  );
+}
+
+typedef _UnsignedTransaction = ({
+  int version,
+  List<_UnsignedTransactionInput> inputs,
+  List<_UnsignedTransactionOutput> outputs,
+  int locktime,
+});
+
+typedef _UnsignedTransactionInput = ({
+  Uint8List txid,
+  int outputIndex,
+  int sequence,
+});
+
+typedef _UnsignedTransactionOutput = ({int amount, Uint8List script});

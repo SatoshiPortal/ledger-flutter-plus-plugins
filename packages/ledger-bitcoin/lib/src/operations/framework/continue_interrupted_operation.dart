@@ -5,8 +5,11 @@ import 'package:ledger_flutter_plus/ledger_flutter_plus_dart.dart';
 
 class ContinueInterruptedOperation extends LedgerInputOperation<Uint8List> {
   final Uint8List inputData;
+  final int protocolVersion;
 
-  ContinueInterruptedOperation(this.inputData) : super(0xF8, 0x01);
+  ContinueInterruptedOperation(this.inputData, {this.protocolVersion = 0})
+      : assert(protocolVersion == 0 || protocolVersion == 1),
+        super(0xF8, 0x01);
 
   @override
   Future<Uint8List> read(ByteDataReader reader) async =>
@@ -16,7 +19,7 @@ class ContinueInterruptedOperation extends LedgerInputOperation<Uint8List> {
   int get p1 => 0x00;
 
   @override
-  int get p2 => 0x00;
+  int get p2 => protocolVersion;
 
   @override
   Future<Uint8List> writeInputData() async => inputData;

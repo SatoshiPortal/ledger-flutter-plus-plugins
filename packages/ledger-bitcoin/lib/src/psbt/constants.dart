@@ -1,7 +1,8 @@
 import 'dart:typed_data';
 
 enum PSBTGlobal {
-  txVersion(0x02),  // Exclude for v0
+  unsignedTX(0x00),
+  txVersion(0x02), // Exclude for v0
   fallbackLocktime(0x03), // Exclude for v0
   inputCount(0x04), // Exclude for v0
   outputCount(0x05), // Exclude for v0
@@ -25,6 +26,8 @@ enum PSBTIn {
   previousTXID(0x0e), // Exclude for v0
   outputIndex(0x0f), // Exclude for v0
   sequence(0x10), // Exclude for v0
+  requiredTimeLocktime(0x11), // Exclude for v0
+  requiredHeightLocktime(0x12), // Exclude for v0
   tapKeySig(0x13),
   tapBip32Derivation(0x16);
 

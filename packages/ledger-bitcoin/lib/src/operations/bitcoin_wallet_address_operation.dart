@@ -12,6 +12,7 @@ class BitcoinWalletAddressOperation extends LedgerInputOperation<Uint8List> {
   final Uint8List? walletHMAC;
   final int change;
   final int addressIndex;
+  final int protocolVersion;
 
   BitcoinWalletAddressOperation({
     required this.walletPolicy,
@@ -19,7 +20,9 @@ class BitcoinWalletAddressOperation extends LedgerInputOperation<Uint8List> {
     required this.change,
     required this.addressIndex,
     this.walletHMAC,
-  }) : super(0xE1, 0x03);
+    this.protocolVersion = 0,
+  })  : assert(protocolVersion == 0 || protocolVersion == 1),
+        super(0xE1, 0x03);
 
   @override
   Future<Uint8List> read(ByteDataReader reader) async =>
@@ -29,7 +32,7 @@ class BitcoinWalletAddressOperation extends LedgerInputOperation<Uint8List> {
   int get p1 => 0x00;
 
   @override
-  int get p2 => 0x00;
+  int get p2 => protocolVersion;
 
   @override
   Future<Uint8List> writeInputData() async {
@@ -41,7 +44,7 @@ class BitcoinWalletAddressOperation extends LedgerInputOperation<Uint8List> {
 
     final writer = ByteDataWriter()
       ..writeUint8(displayWalletAddressByte)
-      ..write(walletPolicy.id)
+      ..write(protocolVersion == 0 ? walletPolicy.legacyId : walletPolicy.id)
       ..write(walletHMACBytes)
       ..writeUint8(change)
       ..writeUint32(addressIndex);

@@ -1,4 +1,5 @@
 import 'dart:core';
+import 'dart:convert';
 import 'dart:typed_data';
 
 import 'package:ledger_bitcoin/src/commands/client_command.dart';
@@ -10,6 +11,7 @@ import 'package:ledger_bitcoin/src/utils/merkle/merkle.dart';
 import 'package:ledger_bitcoin/src/utils/merkle/merkle_map.dart';
 import 'package:ledger_bitcoin/src/utils/uint8list_extension.dart';
 import 'package:ledger_bitcoin/src/utils/utils.dart';
+import 'package:ledger_bitcoin/src/wallet_policy.dart';
 
 import 'commands/yield_command.dart';
 
@@ -60,6 +62,12 @@ class ClientCommandInterpreter {
   void addKnownMapping(MerkleMap mm) {
     addKnownList(mm.keys);
     addKnownList(mm.values);
+  }
+
+  void addKnownWalletPolicy(WalletPolicy walletPolicy) {
+    addKnownPreimage(walletPolicy.serialize());
+    addKnownList(walletPolicy.keys.map((key) => ascii.encode(key)));
+    addKnownPreimage(ascii.encode(walletPolicy.descriptorTemplate));
   }
 
   Uint8List execute(Uint8List request) {
