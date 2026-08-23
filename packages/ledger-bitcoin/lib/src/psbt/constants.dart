@@ -29,7 +29,9 @@ enum PSBTIn {
   requiredTimeLocktime(0x11), // Exclude for v0
   requiredHeightLocktime(0x12), // Exclude for v0
   tapKeySig(0x13),
-  tapBip32Derivation(0x16);
+  tapScriptSig(0x14),
+  tapBip32Derivation(0x16),
+  tapInternalKey(0x17);
 
   const PSBTIn(this.value);
 

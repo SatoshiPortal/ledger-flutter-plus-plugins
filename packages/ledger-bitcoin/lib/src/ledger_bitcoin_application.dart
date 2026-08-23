@@ -156,8 +156,8 @@ class BitcoinLedgerApp {
     );
   }
 
-  /// Adds non-Taproot signatures returned by the Ledger and returns an updated
-  /// PSBT in version 0 format without finalizing the transaction.
+  /// Adds signatures returned by the Ledger and returns an updated PSBT in
+  /// version 0 format without finalizing the transaction.
   Future<Uint8List> signPsbtWithWalletPolicy({
     required Uint8List psbt,
     required WalletPolicy walletPolicy,
@@ -165,7 +165,10 @@ class BitcoinLedgerApp {
   }) async {
     _ensureRegisteredWalletPolicy(walletPolicy);
     _validateWalletHMAC(walletHMAC);
-    final parsedPsbt = PsbtV2()..deserialize(psbt);
+    final parsedPsbt = PsbtV2()
+      ..deserialize(psbt)
+      ..setEffectiveLocktimeAsFallback()
+      ..normalizeInputUtxosForSigning();
     final yielded = await _requestPsbtSignatures(
       psbt: parsedPsbt,
       walletPolicy: walletPolicy,
@@ -174,20 +177,17 @@ class BitcoinLedgerApp {
     );
 
     for (final payload in yielded) {
-      final (inputIndex, pubkey, signature) =
+      final (inputIndex, keyAugment, signature) =
           parseSignPsbtPartialSignature(payload);
-      if (inputIndex >= parsedPsbt.getGlobalInputCount() ||
-          parsedPsbt.getInputBip32Derivation(inputIndex, pubkey) == null) {
+      if (inputIndex >= parsedPsbt.getGlobalInputCount()) {
         throw Exception('Unexpected signature returned by Ledger');
       }
-
-      final existingSignature =
-          parsedPsbt.getInputPartialSig(inputIndex, pubkey);
-      if (existingSignature != null &&
-          !listEquals(existingSignature, signature)) {
-        throw Exception('Ledger returned a conflicting signature');
-      }
-      parsedPsbt.setInputPartialSig(inputIndex, pubkey, signature);
+      applyWalletPolicySignature(
+        psbt: parsedPsbt,
+        inputIndex: inputIndex,
+        keyAugment: keyAugment,
+        signature: signature,
+      );
     }
     return parsedPsbt.asPsbtV0();
   }
@@ -418,5 +418,75 @@ class BitcoinLedgerApp {
         'Registered wallets require a name',
       );
     }
+  }
+}
+
+void applyWalletPolicySignature({
+  required PsbtV2 psbt,
+  required int inputIndex,
+  required Uint8List keyAugment,
+  required Uint8List signature,
+}) {
+  validateSignPsbtSignatureSighash(
+    signature: signature,
+    requestedSighash: psbt.getInputSighashType(inputIndex),
+    isTaproot: keyAugment.length != 33,
+  );
+  if (keyAugment.length == 33) {
+    if (psbt.getInputBip32Derivation(inputIndex, keyAugment) == null) {
+      throw Exception('Unexpected signature returned by Ledger');
+    }
+    _rejectConflictingSignature(
+      psbt.getInputPartialSig(inputIndex, keyAugment),
+      signature,
+    );
+    psbt.setInputPartialSig(inputIndex, keyAugment, signature);
+    return;
+  }
+
+  final pubkey = Uint8List.sublistView(keyAugment, 0, 32);
+  if (keyAugment.length == 32) {
+    final scriptPubKey = psbt.getInputUtxoScript(inputIndex);
+    if (scriptPubKey == null ||
+        scriptPubKey.length != 34 ||
+        scriptPubKey[0] != 0x51 ||
+        scriptPubKey[1] != 0x20 ||
+        !listEquals(Uint8List.sublistView(scriptPubKey, 2), pubkey)) {
+      throw Exception('Unexpected signature returned by Ledger');
+    }
+    _rejectConflictingSignature(
+      psbt.getInputTapKeySig(inputIndex),
+      signature,
+    );
+    psbt.setInputTapKeySig(inputIndex, signature);
+    return;
+  }
+
+  final derivationKeys = psbt.getInputKeyDatas(
+    inputIndex,
+    PSBTIn.tapBip32Derivation,
+  );
+  if (!derivationKeys.any((key) => listEquals(key, pubkey))) {
+    throw Exception('Unexpected signature returned by Ledger');
+  }
+  final (leafHashes, _, _) =
+      psbt.getInputTapBip32Derivation(inputIndex, pubkey);
+  final leafHash = Uint8List.sublistView(keyAugment, 32);
+  if (!leafHashes.any((hash) => listEquals(hash, leafHash))) {
+    throw Exception('Unexpected signature returned by Ledger');
+  }
+  _rejectConflictingSignature(
+    psbt.getInputTapScriptSig(inputIndex, pubkey, leafHash),
+    signature,
+  );
+  psbt.setInputTapScriptSig(inputIndex, pubkey, leafHash, signature);
+}
+
+void _rejectConflictingSignature(
+  Uint8List? existingSignature,
+  Uint8List signature,
+) {
+  if (existingSignature != null && !listEquals(existingSignature, signature)) {
+    throw Exception('Ledger returned a conflicting signature');
   }
 }

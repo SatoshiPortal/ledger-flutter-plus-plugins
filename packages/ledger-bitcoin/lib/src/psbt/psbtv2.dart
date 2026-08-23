@@ -9,6 +9,7 @@ import 'package:ledger_bitcoin/src/utils/buffer_reader.dart';
 import 'package:ledger_bitcoin/src/utils/buffer_writer.dart';
 import 'package:ledger_bitcoin/src/utils/int_extension.dart';
 import 'package:ledger_bitcoin/src/utils/uint8list_extension.dart';
+import 'package:ledger_bitcoin/src/utils/utils.dart';
 
 /// Implements Partially Signed Bitcoin Transaction version 2, BIP370, as
 /// documented at https://github.com/bitcoin/bips/blob/master/bip-0370.mediawiki
@@ -20,9 +21,8 @@ import 'package:ledger_bitcoin/src/utils/uint8list_extension.dart';
 /// broadcast.
 ///
 /// This implementation is limited to what's needed in ledger_bitcoin to carry
-/// out its duties, which means that support for features like multisig or
-/// taproot script path spending are not implemented. Specifically, it supports
-/// p2pkh, p2wpkhWrappedInP2sh, p2wpkh and p2tr key path spending.
+/// out its duties. It stores the Taproot fields required for registered wallet
+/// policy signing, but its transaction finalizer only supports key-path spends.
 ///
 /// This class is made purposefully dumb, so it's easy to add support for
 /// complementary fields as needed in the future.
@@ -82,6 +82,54 @@ class PsbtV2 {
     if (utxo == null) return null;
     final buf = BufferReader(utxo);
     return (buf.readSlice(8), buf.readVarSlice());
+  }
+
+  Uint8List? getInputUtxoScript(int inputIndex) {
+    final witnessUtxo = getInputWitnessUtxo(inputIndex);
+    if (witnessUtxo != null) return witnessUtxo.$2;
+
+    return _getInputNonWitnessOutput(inputIndex)?.script;
+  }
+
+  void normalizeInputUtxosForSigning() {
+    for (var inputIndex = 0; inputIndex < inputMaps.length; inputIndex++) {
+      final output = _getInputNonWitnessOutput(inputIndex);
+      if (output == null) continue;
+      final redeemScript = getInputRedeemScript(inputIndex);
+      final isWitnessInput = _isWitnessProgram(output.script) ||
+          (redeemScript != null && _isWitnessProgram(redeemScript));
+      if (!isWitnessInput) {
+        deleteInputEntries(inputIndex, [PSBTIn.witnessUTXO]);
+        continue;
+      }
+      if (getInputWitnessUtxo(inputIndex) != null) continue;
+      setInputWitnessUtxo(
+        inputIndex,
+        output.amount.toUint64LE(),
+        output.script,
+      );
+    }
+  }
+
+  _UnsignedTransactionOutput? _getInputNonWitnessOutput(int inputIndex) {
+    final transaction = getInputNonWitnessUtxo(inputIndex);
+    if (transaction == null) return null;
+    final previousTransaction = _parsePreviousTransaction(transaction);
+    if (!listEquals(
+      previousTransaction.txid,
+      getInputPreviousTxid(inputIndex),
+    )) {
+      throw const FormatException(
+        'PSBT non-witness UTXO does not match the previous transaction ID',
+      );
+    }
+    final outputIndex = getInputOutputIndex(inputIndex);
+    if (outputIndex >= previousTransaction.outputs.length) {
+      throw const FormatException(
+        'PSBT non-witness UTXO does not contain the referenced output',
+      );
+    }
+    return previousTransaction.outputs[outputIndex];
   }
 
   void setInputPartialSig(
@@ -188,6 +236,27 @@ class PsbtV2 {
   Uint8List? getInputTapKeySig(int inputIndex) =>
       _getInputOptional(inputIndex, PSBTIn.tapKeySig, _b());
 
+  void setInputTapScriptSig(int inputIndex, Uint8List pubkey,
+      Uint8List leafHash, Uint8List signature) {
+    if (pubkey.length != 32 || leafHash.length != 32) {
+      throw ArgumentError('Taproot script signature key must be 64 bytes');
+    }
+    _setInput(
+      inputIndex,
+      PSBTIn.tapScriptSig,
+      joinUint8Lists([pubkey, leafHash]),
+      signature,
+    );
+  }
+
+  Uint8List? getInputTapScriptSig(
+          int inputIndex, Uint8List pubkey, Uint8List leafHash) =>
+      _getInputOptional(
+        inputIndex,
+        PSBTIn.tapScriptSig,
+        joinUint8Lists([pubkey, leafHash]),
+      );
+
   void setInputTapBip32Derivation(int inputIndex, Uint8List pubkey,
       List<Uint8List> hashes, Uint8List masterFingerprint, List<int> path) {
     if (pubkey.length != 32) {
@@ -201,6 +270,9 @@ class PsbtV2 {
           int inputIndex, Uint8List pubkey) =>
       _decodeTapBip32Derivation(
           _getInput(inputIndex, PSBTIn.tapBip32Derivation, pubkey));
+
+  Uint8List? getInputTapInternalKey(int inputIndex) =>
+      _getInputOptional(inputIndex, PSBTIn.tapInternalKey, _b());
 
   List<Uint8List> getInputKeyDatas(int inputIndex, PSBTIn keyType) =>
       _getKeyDatas(inputMaps[inputIndex], keyType.value);
@@ -301,7 +373,13 @@ class PsbtV2 {
     }
     while (_readKeyPair(globalMap, bufferReader)) {}
 
+    if (_containsNonEmptyKeyData(globalMap, PSBTGlobal.unsignedTX.value) ||
+        _containsNonEmptyKeyData(globalMap, PSBTGlobal.version.value)) {
+      throw const FormatException('PSBT global singleton contains key data');
+    }
+
     final versionBytes = _getGlobalOptional(PSBTGlobal.version);
+    _validateValueLength(globalMap, PSBTGlobal.version.value, 4);
     final psbtVersion = versionBytes?.readUint32LE(0) ?? 0;
     if (psbtVersion != 0 && psbtVersion != 2) {
       throw Exception('Only PSBT versions 0 and 2 are supported');
@@ -371,6 +449,11 @@ class PsbtV2 {
         throw const FormatException(
             'PSBT v2 is missing a required global field');
       }
+      _validateValueLength(globalMap, PSBTGlobal.txVersion.value, 4);
+      _validateValueLength(globalMap, PSBTGlobal.fallbackLocktime.value, 4);
+      _validateCompactSize(globalMap, PSBTGlobal.inputCount.value);
+      _validateCompactSize(globalMap, PSBTGlobal.outputCount.value);
+      _validateValueLength(globalMap, PSBTGlobal.txModifiable.value, 1);
       return;
     }
 
@@ -414,6 +497,13 @@ class PsbtV2 {
         throw const FormatException(
             'PSBT v2 input is missing a required field');
       }
+      for (final map in inputMaps) {
+        _validateValueLength(map, PSBTIn.previousTXID.value, 32);
+        _validateValueLength(map, PSBTIn.outputIndex.value, 4);
+        _validateValueLength(map, PSBTIn.sequence.value, 4);
+        _validateValueLength(map, PSBTIn.requiredTimeLocktime.value, 4);
+        _validateValueLength(map, PSBTIn.requiredHeightLocktime.value, 4);
+      }
 
       final v2OutputKeyTypes = [
         PSBTOut.amount.value,
@@ -437,6 +527,9 @@ class PsbtV2 {
       )) {
         throw const FormatException(
             'PSBT v2 output is missing a required field');
+      }
+      for (final map in outputMaps) {
+        _validateValueLength(map, PSBTOut.amount.value, 8);
       }
       return;
     }
@@ -479,6 +572,33 @@ class PsbtV2 {
     );
   }
 
+  void _validateValueLength(
+    Map<String, Uint8List> map,
+    int keyType,
+    int expectedLength,
+  ) {
+    final value = map[Key(keyType, Uint8List(0)).toString()];
+    if (value != null && value.length != expectedLength) {
+      throw const FormatException('PSBT field has an invalid value length');
+    }
+  }
+
+  void _validateCompactSize(Map<String, Uint8List> map, int keyType) {
+    final value = map[Key(keyType, Uint8List(0)).toString()];
+    if (value == null) return;
+
+    var valid = false;
+    try {
+      valid = listEquals(intFromVarint(value).toVarint(), value);
+    } catch (_) {
+      // Report malformed external data as a PSBT format failure.
+    }
+    if (!valid) {
+      throw const FormatException(
+          'PSBT field has an invalid CompactSize value');
+    }
+  }
+
   void _normalizeToV2(_UnsignedTransaction transaction) {
     setGlobalPsbtVersion(2);
     setGlobalTxVersion(transaction.version);
@@ -506,8 +626,12 @@ class PsbtV2 {
     final keyType = bufferReader.readUInt8();
     final keyData = bufferReader.readSlice(keyLen - 1);
     final value = bufferReader.readVarSlice();
+    final key = Key(keyType, keyData).toString();
+    if (map.containsKey(key)) {
+      throw const FormatException('PSBT contains a duplicate key');
+    }
 
-    map.set(keyType, keyData, value);
+    map[key] = value;
     return true;
   }
 
@@ -619,11 +743,11 @@ _UnsignedTransaction _parseUnsignedTransaction(Uint8List bytes) {
   final version = reader.readUInt32();
   final inputs = <_UnsignedTransactionInput>[];
 
-  final inputCount = reader.readVarInt();
+  final inputCount = reader.readCanonicalVarInt();
   for (var i = 0; i < inputCount; i++) {
     final txid = reader.readSlice(32);
     final outputIndex = reader.readUInt32();
-    if (reader.readVarSlice().isNotEmpty) {
+    if (reader.readCanonicalVarSlice().isNotEmpty) {
       throw Exception('PSBT unsigned transaction has a non-empty scriptSig');
     }
     inputs.add((
@@ -634,9 +758,12 @@ _UnsignedTransaction _parseUnsignedTransaction(Uint8List bytes) {
   }
 
   final outputs = <_UnsignedTransactionOutput>[];
-  final outputCount = reader.readVarInt();
+  final outputCount = reader.readCanonicalVarInt();
   for (var i = 0; i < outputCount; i++) {
-    outputs.add((amount: reader.readUInt64(), script: reader.readVarSlice()));
+    outputs.add((
+      amount: reader.readUInt64(),
+      script: reader.readCanonicalVarSlice(),
+    ));
   }
 
   final locktime = reader.readUInt32();
@@ -649,6 +776,73 @@ _UnsignedTransaction _parseUnsignedTransaction(Uint8List bytes) {
     outputs: outputs,
     locktime: locktime,
   );
+}
+
+_PreviousTransaction _parsePreviousTransaction(Uint8List bytes) {
+  final reader = BufferReader(bytes);
+  final stripped = BufferWriter();
+  final version = reader.readUInt32();
+  stripped.writeUInt32(version);
+
+  var inputCount = reader.readCanonicalVarInt();
+  var hasWitness = false;
+  if (inputCount == 0) {
+    if (reader.readUInt8() != 1) {
+      throw const FormatException('Invalid witness transaction marker');
+    }
+    hasWitness = true;
+    inputCount = reader.readCanonicalVarInt();
+  }
+  stripped.writeVarInt(inputCount);
+  for (var i = 0; i < inputCount; i++) {
+    stripped
+      ..writeSlice(reader.readSlice(32))
+      ..writeUInt32(reader.readUInt32())
+      ..writeVarSlice(reader.readCanonicalVarSlice())
+      ..writeUInt32(reader.readUInt32());
+  }
+
+  final outputCount = reader.readCanonicalVarInt();
+  stripped.writeVarInt(outputCount);
+  final outputs = <_UnsignedTransactionOutput>[];
+  for (var i = 0; i < outputCount; i++) {
+    final amount = reader.readUInt64();
+    final script = reader.readCanonicalVarSlice();
+    outputs.add((amount: amount, script: script));
+    stripped
+      ..writeUInt64(amount)
+      ..writeVarSlice(script);
+  }
+
+  if (hasWitness) {
+    var hasWitnessData = false;
+    for (var i = 0; i < inputCount; i++) {
+      if (reader.readCanonicalVector().isNotEmpty) {
+        hasWitnessData = true;
+      }
+    }
+    if (!hasWitnessData) {
+      throw const FormatException('Superfluous witness serialization');
+    }
+  }
+  stripped.writeUInt32(reader.readUInt32());
+  if (reader.available() != 0) {
+    throw const FormatException('Unexpected trailing transaction data');
+  }
+
+  final firstHash = sha256Hasher(stripped.buffer());
+  return (txid: sha256Hasher(firstHash), outputs: outputs);
+}
+
+bool _isWitnessProgram(Uint8List script) {
+  if (script.length < 4 || script.length > 42) return false;
+  final version = script.first;
+  final isWitnessVersion = version == 0 || (version >= 0x51 && version <= 0x60);
+  final programLength = script[1];
+  return isWitnessVersion &&
+      programLength >= 2 &&
+      programLength <= 40 &&
+      script.length == programLength + 2;
 }
 
 typedef _UnsignedTransaction = ({
@@ -665,3 +859,8 @@ typedef _UnsignedTransactionInput = ({
 });
 
 typedef _UnsignedTransactionOutput = ({int amount, Uint8List script});
+
+typedef _PreviousTransaction = ({
+  Uint8List txid,
+  List<_UnsignedTransactionOutput> outputs,
+});

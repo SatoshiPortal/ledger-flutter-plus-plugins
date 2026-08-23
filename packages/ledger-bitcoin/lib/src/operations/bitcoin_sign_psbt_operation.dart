@@ -65,11 +65,73 @@ class BitcoinSignPsbtOperation extends LedgerInputOperation<Uint8List> {
   }
 
   final pubkeyLength = reader.readUInt8();
-  if (pubkeyLength != 33 || reader.available() <= pubkeyLength) {
+  if (pubkeyLength != 32 && pubkeyLength != 33 && pubkeyLength != 64) {
     throw FormatException('Unsupported SIGN_PSBT public key');
+  }
+  if (reader.available() <= pubkeyLength) {
+    throw FormatException('Unsupported SIGN_PSBT response');
   }
 
   final pubkey = reader.readSlice(pubkeyLength);
   final signature = reader.readSlice(reader.available());
+  if (pubkeyLength == 33) {
+    if (!_isValidEcdsaSignature(signature)) {
+      throw FormatException('Invalid ECDSA signature');
+    }
+  } else if (!_isValidTaprootSignature(signature)) {
+    throw FormatException('Invalid Taproot signature');
+  }
   return (inputIndex, pubkey, signature);
+}
+
+bool _isValidEcdsaSignature(Uint8List signature) {
+  if (signature.length < 9 || signature.length > 73) return false;
+  if (signature[0] != 0x30 || signature[1] != signature.length - 3) {
+    return false;
+  }
+
+  final rLength = signature[3];
+  if (5 + rLength >= signature.length) return false;
+  final sLength = signature[5 + rLength];
+  if (rLength + sLength + 7 != signature.length ||
+      signature[2] != 0x02 ||
+      rLength == 0 ||
+      signature[4] & 0x80 != 0 ||
+      rLength > 1 && signature[4] == 0 && signature[5] & 0x80 == 0 ||
+      signature[4 + rLength] != 0x02 ||
+      sLength == 0 ||
+      signature[6 + rLength] & 0x80 != 0 ||
+      sLength > 1 &&
+          signature[6 + rLength] == 0 &&
+          signature[7 + rLength] & 0x80 == 0) {
+    return false;
+  }
+  return _isDefinedSighash(signature.last);
+}
+
+bool _isValidTaprootSignature(Uint8List signature) =>
+    signature.length == 64 ||
+    signature.length == 65 && _isDefinedSighash(signature.last);
+
+bool _isDefinedSighash(int sighash) =>
+    sighash == 0x01 ||
+    sighash == 0x02 ||
+    sighash == 0x03 ||
+    sighash == 0x81 ||
+    sighash == 0x82 ||
+    sighash == 0x83;
+
+void validateSignPsbtSignatureSighash({
+  required Uint8List signature,
+  required int? requestedSighash,
+  required bool isTaproot,
+}) {
+  if (requestedSighash == null) return;
+  final returnedSighash =
+      isTaproot && signature.length == 64 ? 0x00 : signature.last;
+  if (returnedSighash != requestedSighash) {
+    throw const FormatException(
+      'Ledger returned a signature with an unexpected sighash type',
+    );
+  }
 }
