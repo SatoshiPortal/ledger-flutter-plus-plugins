@@ -7,12 +7,14 @@ import 'package:ledger_bitcoin/src/client_command_interpreter.dart';
 import 'package:ledger_bitcoin/src/ledger_app_version.dart';
 import 'package:ledger_bitcoin/src/operations/bitcoin_extended_public_key_operation.dart';
 import 'package:ledger_bitcoin/src/operations/bitcoin_master_fingerprint_operation.dart';
+import 'package:ledger_bitcoin/src/operations/bitcoin_register_wallet_operation.dart';
 import 'package:ledger_bitcoin/src/operations/bitcoin_sign_message_operation.dart';
 import 'package:ledger_bitcoin/src/operations/bitcoin_sign_psbt_operation.dart';
 import 'package:ledger_bitcoin/src/operations/bitcoin_version_operation.dart';
 import 'package:ledger_bitcoin/src/operations/bitcoin_wallet_address_operation.dart';
 import 'package:ledger_bitcoin/src/psbt/constants.dart';
 import 'package:ledger_bitcoin/src/psbt/merkelized_psbt.dart';
+import 'package:ledger_bitcoin/src/psbt/psbt_converter.dart';
 import 'package:ledger_bitcoin/src/psbt/psbt_extractor.dart';
 import 'package:ledger_bitcoin/src/psbt/psbt_finalizer.dart';
 import 'package:ledger_bitcoin/src/psbt/psbtv2.dart';
@@ -94,6 +96,102 @@ class BitcoinLedgerApp {
       connection.sendOperation<Uint8List>(BitcoinMasterFingerprintOperation(),
           transformer: transformer);
 
+  /// Registers a protocol-v1 wallet policy and returns the HMAC that must be
+  /// supplied with future address and signing requests for that policy.
+  Future<({Uint8List walletId, Uint8List walletHMAC})> registerWallet({
+    required WalletPolicy walletPolicy,
+  }) async {
+    _ensureRegisteredWalletPolicy(walletPolicy);
+    final clientInterpreter = ClientCommandInterpreter(() {})
+      ..addKnownWalletPolicy(walletPolicy);
+    final response = await connection.runFlow(
+      BitcoinRegisterWalletOperation(walletPolicy: walletPolicy),
+      clientInterpreter,
+    );
+    if (response.length != 64) {
+      throw Exception('Invalid wallet registration response');
+    }
+
+    final walletId = response.sublist(0, 32);
+    if (!listEquals(walletId, walletPolicy.id)) {
+      throw Exception('Unexpected wallet policy id');
+    }
+    return (walletId: walletId, walletHMAC: response.sublist(32));
+  }
+
+  /// Gets an address from a registered wallet policy, displaying it on the
+  /// Ledger by default.
+  Future<Uint8List> getWalletAddressWithPolicy({
+    required WalletPolicy walletPolicy,
+    required Uint8List walletHMAC,
+    required int change,
+    required int addressIndex,
+    bool display = true,
+  }) async {
+    _ensureRegisteredWalletPolicy(walletPolicy);
+    _validateWalletHMAC(walletHMAC);
+    if (change != 0 && change != 1) {
+      throw ArgumentError.value(change, 'change', 'Must be 0 or 1');
+    }
+    if (addressIndex < 0 || addressIndex >= 1 << 31) {
+      throw ArgumentError.value(
+        addressIndex,
+        'addressIndex',
+        'Must be between 0 and 2^31 - 1',
+      );
+    }
+
+    final clientInterpreter = ClientCommandInterpreter(() {})
+      ..addKnownWalletPolicy(walletPolicy);
+    return connection.runFlow(
+      BitcoinWalletAddressOperation(
+        walletPolicy: walletPolicy,
+        walletHMAC: walletHMAC,
+        change: change,
+        addressIndex: addressIndex,
+        displayWalletAddress: display,
+        protocolVersion: 1,
+      ),
+      clientInterpreter,
+    );
+  }
+
+  /// Adds signatures returned by the Ledger and returns an updated PSBT in
+  /// version 0 format without finalizing the transaction.
+  Future<Uint8List> signPsbtWithWalletPolicy({
+    required Uint8List psbt,
+    required WalletPolicy walletPolicy,
+    required Uint8List walletHMAC,
+  }) async {
+    _ensureRegisteredWalletPolicy(walletPolicy);
+    _validateWalletHMAC(walletHMAC);
+    final parsedPsbt = PsbtV2()
+      ..deserialize(psbt)
+      ..setEffectiveLocktimeAsFallback()
+      ..normalizeInputUtxosForSigning();
+    final yielded = await _requestPsbtSignatures(
+      psbt: parsedPsbt,
+      walletPolicy: walletPolicy,
+      walletHMAC: walletHMAC,
+      protocolVersion: 1,
+    );
+
+    for (final payload in yielded) {
+      final (inputIndex, keyAugment, signature) =
+          parseSignPsbtPartialSignature(payload);
+      if (inputIndex >= parsedPsbt.getGlobalInputCount()) {
+        throw Exception('Unexpected signature returned by Ledger');
+      }
+      applyWalletPolicySignature(
+        psbt: parsedPsbt,
+        inputIndex: inputIndex,
+        keyAugment: keyAugment,
+        signature: signature,
+      );
+    }
+    return parsedPsbt.asPsbtV0();
+  }
+
   Future<Uint8List> signTransaction(Uint8List transaction) {
     final psbt = PsbtV2();
     psbt.deserialize(transaction);
@@ -174,7 +272,7 @@ class BitcoinLedgerApp {
     final clientInterpreter = ClientCommandInterpreter(() {});
     clientInterpreter
         .addKnownList(policy.keys.map((k) => ascii.encode(k)).toList());
-    clientInterpreter.addKnownPreimage(policy.serialize());
+    clientInterpreter.addKnownPreimage(policy.serializeLegacy());
 
     return await connection.runFlow(
       BitcoinWalletAddressOperation(
@@ -208,46 +306,12 @@ class BitcoinLedgerApp {
     required WalletPolicy walletPolicy,
     Uint8List? walletHMAC,
   }) async {
-    final merkelizedPsbt = MerkelizedPsbt(psbt);
-
-    if (walletHMAC != null && walletHMAC.length != 32) {
-      throw Exception("Invalid HMAC length");
-    }
-
-    // prepare ClientCommandInterpreter
-    final clientInterpreter = ClientCommandInterpreter(() {})
-      ..addKnownList(walletPolicy.keys.map((k) => ascii.encode(k)).toList())
-      ..addKnownPreimage(walletPolicy.serialize())
-      ..addKnownMapping(merkelizedPsbt.globalMerkleMap);
-
-    for (final map in merkelizedPsbt.inputMerkleMaps) {
-      clientInterpreter.addKnownMapping(map);
-    }
-    for (final map in merkelizedPsbt.outputMerkleMaps) {
-      clientInterpreter.addKnownMapping(map);
-    }
-
-    clientInterpreter.addKnownList(merkelizedPsbt.inputMapCommitments);
-    final inputMapsRoot = Merkle(
-      merkelizedPsbt.inputMapCommitments.map((m) => hashLeaf(m)),
-    ).root;
-    clientInterpreter.addKnownList(merkelizedPsbt.outputMapCommitments);
-    final outputMapsRoot = Merkle(
-      merkelizedPsbt.outputMapCommitments.map((m) => hashLeaf(m)),
-    ).root;
-
-    await connection.runFlow(
-      BitcoinSignPsbtOperation(
-          walletPolicy: walletPolicy,
-          globalKeysValuesRoot: merkelizedPsbt.globalKeysValuesRoot,
-          inputCount: merkelizedPsbt.getGlobalInputCount(),
-          inputsMapsRoot: inputMapsRoot,
-          outputCount: merkelizedPsbt.getGlobalOutputCount(),
-          outputsMapsRoot: outputMapsRoot),
-      clientInterpreter,
+    final yielded = await _requestPsbtSignatures(
+      psbt: psbt,
+      walletPolicy: walletPolicy,
+      walletHMAC: walletHMAC,
+      protocolVersion: 0,
     );
-
-    final yielded = clientInterpreter.yielded;
 
     final sigs = <int, Uint8List>{};
     for (final inputAndSig in yielded) {
@@ -273,5 +337,156 @@ class BitcoinLedgerApp {
 
     psbt.finalize();
     return psbt.extract();
+  }
+
+  Future<List<Uint8List>> _requestPsbtSignatures({
+    required PsbtV2 psbt,
+    required WalletPolicy walletPolicy,
+    required int protocolVersion,
+    Uint8List? walletHMAC,
+  }) async {
+    if (walletHMAC != null) {
+      _validateWalletHMAC(walletHMAC);
+    }
+
+    final merkelizedPsbt = MerkelizedPsbt(psbt);
+    final clientInterpreter = ClientCommandInterpreter(() {});
+    if (protocolVersion == 0) {
+      clientInterpreter
+        ..addKnownList(walletPolicy.keys.map((key) => ascii.encode(key)))
+        ..addKnownPreimage(walletPolicy.serializeLegacy());
+    } else {
+      clientInterpreter.addKnownWalletPolicy(walletPolicy);
+    }
+    clientInterpreter.addKnownMapping(merkelizedPsbt.globalMerkleMap);
+
+    for (final map in merkelizedPsbt.inputMerkleMaps) {
+      clientInterpreter.addKnownMapping(map);
+    }
+    for (final map in merkelizedPsbt.outputMerkleMaps) {
+      clientInterpreter.addKnownMapping(map);
+    }
+
+    clientInterpreter.addKnownList(merkelizedPsbt.inputMapCommitments);
+    final inputMapsRoot = Merkle(
+      merkelizedPsbt.inputMapCommitments.map(hashLeaf),
+    ).root;
+    clientInterpreter.addKnownList(merkelizedPsbt.outputMapCommitments);
+    final outputMapsRoot = Merkle(
+      merkelizedPsbt.outputMapCommitments.map(hashLeaf),
+    ).root;
+
+    await connection.runFlow(
+      BitcoinSignPsbtOperation(
+        walletPolicy: walletPolicy,
+        walletHMAC: walletHMAC,
+        globalKeysValuesRoot: merkelizedPsbt.globalKeysValuesRoot,
+        inputCount: merkelizedPsbt.getGlobalInputCount(),
+        inputsMapsRoot: inputMapsRoot,
+        outputCount: merkelizedPsbt.getGlobalOutputCount(),
+        outputsMapsRoot: outputMapsRoot,
+        protocolVersion: protocolVersion,
+      ),
+      clientInterpreter,
+    );
+    return clientInterpreter.yielded;
+  }
+
+  void _validateWalletHMAC(Uint8List walletHMAC) {
+    if (walletHMAC.length != 32) {
+      throw ArgumentError.value(
+        walletHMAC.length,
+        'walletHMAC.length',
+        'Must be 32 bytes',
+      );
+    }
+  }
+
+  void _ensureRegisteredWalletPolicy(WalletPolicy policy) {
+    if (policy is LegacyWalletPolicy ||
+        policy is NativeSegwitWalletPolicy ||
+        policy is NestedSegwitWalletPolicy ||
+        policy is TaprootWalletPolicy) {
+      throw ArgumentError(
+        'Legacy default wallet policies cannot be used with registered wallet APIs',
+      );
+    }
+    if (policy.name.isEmpty) {
+      throw ArgumentError.value(
+        policy.name,
+        'walletPolicy.name',
+        'Registered wallets require a name',
+      );
+    }
+  }
+}
+
+void applyWalletPolicySignature({
+  required PsbtV2 psbt,
+  required int inputIndex,
+  required Uint8List keyAugment,
+  required Uint8List signature,
+}) {
+  validateSignPsbtSignatureSighash(
+    signature: signature,
+    requestedSighash: psbt.getInputSighashType(inputIndex),
+    isTaproot: keyAugment.length != 33,
+  );
+  if (keyAugment.length == 33) {
+    if (psbt.getInputBip32Derivation(inputIndex, keyAugment) == null) {
+      throw Exception('Unexpected signature returned by Ledger');
+    }
+    _rejectConflictingSignature(
+      psbt.getInputPartialSig(inputIndex, keyAugment),
+      signature,
+    );
+    psbt.setInputPartialSig(inputIndex, keyAugment, signature);
+    return;
+  }
+
+  final pubkey = Uint8List.sublistView(keyAugment, 0, 32);
+  if (keyAugment.length == 32) {
+    final scriptPubKey = psbt.getInputUtxoScript(inputIndex);
+    if (scriptPubKey == null ||
+        scriptPubKey.length != 34 ||
+        scriptPubKey[0] != 0x51 ||
+        scriptPubKey[1] != 0x20 ||
+        !listEquals(Uint8List.sublistView(scriptPubKey, 2), pubkey)) {
+      throw Exception('Unexpected signature returned by Ledger');
+    }
+    _rejectConflictingSignature(
+      psbt.getInputTapKeySig(inputIndex),
+      signature,
+    );
+    psbt.setInputTapKeySig(inputIndex, signature);
+    return;
+  }
+
+  final derivationKeys = psbt.getInputKeyDatas(
+    inputIndex,
+    PSBTIn.tapBip32Derivation,
+  );
+  if (!derivationKeys.any((key) => listEquals(key, pubkey))) {
+    throw Exception('Unexpected signature returned by Ledger');
+  }
+  final (leafHashes, _, _) =
+      psbt.getInputTapBip32Derivation(inputIndex, pubkey);
+  final leafHash = Uint8List.sublistView(keyAugment, 32);
+  if (!leafHashes.any((hash) => listEquals(hash, leafHash))) {
+    throw Exception('Unexpected signature returned by Ledger');
+  }
+  _rejectConflictingSignature(
+    psbt.getInputTapScriptSig(inputIndex, pubkey, leafHash),
+    signature,
+  );
+  psbt.setInputTapScriptSig(inputIndex, pubkey, leafHash, signature);
+}
+
+void _rejectConflictingSignature(
+  Uint8List? existingSignature,
+  Uint8List signature,
+) {
+  if (existingSignature != null && !listEquals(existingSignature, signature)) {
+    throw Exception('Ledger returned a conflicting signature');
   }
 }

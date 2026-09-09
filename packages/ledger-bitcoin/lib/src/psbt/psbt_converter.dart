@@ -7,19 +7,26 @@ import "package:ledger_bitcoin/src/psbt/psbtv2.dart";
 import "package:ledger_bitcoin/src/utils/buffer_writer.dart";
 
 extension V0Serializer on PsbtV2 {
+  void setEffectiveLocktimeAsFallback() =>
+      setGlobalFallbackLocktime(_transactionLocktime());
+
   Uint8List asPsbtV0() {
     final excludedGlobalKeyTypes = [
+      PSBTGlobal.unsignedTX,
       PSBTGlobal.txVersion,
       PSBTGlobal.fallbackLocktime,
       PSBTGlobal.inputCount,
       PSBTGlobal.outputCount,
       PSBTGlobal.txModifiable,
+      PSBTGlobal.version,
     ].map((e) => Key(e.value, Uint8List(0)).toString());
 
     final excludedInputKeyTypes = [
       PSBTIn.previousTXID,
       PSBTIn.outputIndex,
       PSBTIn.sequence,
+      PSBTIn.requiredTimeLocktime,
+      PSBTIn.requiredHeightLocktime,
     ].map((e) => Key(e.value, Uint8List(0)).toString());
 
     final excludedOutputKeyTypes = [
@@ -29,7 +36,6 @@ extension V0Serializer on PsbtV2 {
 
     final buf = BufferWriter()..writeSlice(psbtMagicBytes);
 
-    setGlobalPsbtVersion(0);
     final sGlobalMap = <String, Uint8List>{"00": extractUnsignedTX(false)};
 
     for (final key in globalMap.keys) {
@@ -77,7 +83,49 @@ extension V0Serializer on PsbtV2 {
       tx.writeUInt64(getOutputAmount(i));
       tx.writeVarSlice(getOutputScript(i));
     }
-    tx.writeUInt32(getGlobalFallbackLocktime() ?? 0);
+    tx.writeUInt32(_transactionLocktime());
     return tx.buffer();
+  }
+
+  int _transactionLocktime() {
+    final requiredTimes = <int>[];
+    final requiredHeights = <int>[];
+    var timeAllowed = true;
+    var heightAllowed = true;
+
+    for (var index = 0; index < getGlobalInputCount(); index++) {
+      final time = getInputRequiredTimeLocktime(index);
+      final height = getInputRequiredHeightLocktime(index);
+      if (time == null && height == null) continue;
+      if (time == null) {
+        timeAllowed = false;
+      } else if (time < 500000000) {
+        throw const FormatException('Invalid required time locktime');
+      } else {
+        requiredTimes.add(time);
+      }
+      if (height == null) {
+        heightAllowed = false;
+      } else if (height == 0 || height >= 500000000) {
+        throw const FormatException('Invalid required height locktime');
+      } else {
+        requiredHeights.add(height);
+      }
+    }
+
+    if (heightAllowed && requiredHeights.isNotEmpty) {
+      return requiredHeights.reduce(
+        (maximum, value) => value > maximum ? value : maximum,
+      );
+    }
+    if (timeAllowed && requiredTimes.isNotEmpty) {
+      return requiredTimes.reduce(
+        (maximum, value) => value > maximum ? value : maximum,
+      );
+    }
+    if (requiredTimes.isNotEmpty || requiredHeights.isNotEmpty) {
+      throw const FormatException('PSBT inputs require incompatible locktimes');
+    }
+    return getGlobalFallbackLocktime() ?? 0;
   }
 }

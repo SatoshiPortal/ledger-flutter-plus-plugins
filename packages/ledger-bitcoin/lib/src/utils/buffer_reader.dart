@@ -43,6 +43,15 @@ class BufferReader {
     return vi.output;
   }
 
+  int readCanonicalVarInt() {
+    final vi = varuint.decode(buffer, offset);
+    if (vi.bytes != varuint.encodingLength(vi.output)) {
+      throw const FormatException('Non-canonical CompactSize value');
+    }
+    offset += vi.bytes;
+    return vi.output;
+  }
+
   Uint8List readSlice(int n) {
     if (buffer.length < offset + n) {
       throw Exception("Cannot read slice out of bounds");
@@ -54,11 +63,25 @@ class BufferReader {
 
   Uint8List readVarSlice() => readSlice(readVarInt());
 
+  Uint8List readCanonicalVarSlice() => readSlice(readCanonicalVarInt());
+
   List<Uint8List> readVector() {
     final count = readVarInt();
     final vector = <Uint8List>[];
     for (var i = 0; i < count; i++) {
       vector.add(readVarSlice());
+    }
+    return vector;
+  }
+
+  List<Uint8List> readCanonicalVector() {
+    final count = readCanonicalVarInt();
+    if (count > available()) {
+      throw const FormatException('Vector exceeds the remaining data');
+    }
+    final vector = <Uint8List>[];
+    for (var i = 0; i < count; i++) {
+      vector.add(readCanonicalVarSlice());
     }
     return vector;
   }

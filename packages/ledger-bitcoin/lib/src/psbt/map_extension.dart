@@ -22,7 +22,8 @@ extension PsbtGetAndSet on Map {
   }
 
   void serializeMap(BufferWriter buf) {
-    for (final k in keys) {
+    final sortedKeys = keys.cast<String>().toList()..sort();
+    for (final k in sortedKeys) {
       final value = this[k]!;
       final keyPair = KeyPair(_createKey(hex.decode(k) as Uint8List), value);
       keyPair.serialize(buf);
