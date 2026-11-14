@@ -57,5 +57,5 @@ String _statusWord(Uint8List response) {
   if (response.length < 2) {
     throw const FormatException('Ledger response is missing its status word');
   }
-  return response.sublist(response.length - 2).toHexString();
+  return ToHexString(response.sublist(response.length - 2)).toHexString();
 }
